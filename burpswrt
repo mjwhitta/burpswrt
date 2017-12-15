@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+
+cleanup() {
+    if [[ -z $nodns ]]; then
+        sudo systemctl stop dnsmasq
+        sudo rm -f /etc/dnsmasq.d/burpswrt.conf
+    fi
+    if [[ -f $dnsmasq_mitm ]]; then
+        while read line; do
+            ip="$(echo "$line" | awk '{print $2}')"
+            case "$ip" in
+                *":"*)
+                    dev="$(echo "$ip" | awk -F ":" '{print $1}')"
+                    ip="$(echo "$ip" | awk -F ":" '{print $2}')"
+                    exists="$(ip -o a | \grep -E "$ip/.+$dev")"
+                    if [[ -n $exists ]]; then
+                        sudo ip addr delete $ip/32 dev $dev >/dev/null
+                    fi
+                    ;;
+            esac
+        done <$dnsmasq_mitm
+        if [[ -n $openwrt ]]; then
+            ssh $openwrt \
+                "mv $dnsmasq_backup /etc/dnsmasq.conf 2>/dev/null"
+            ssh $openwrt "/etc/init.d/dnsmasq restart"
+        fi
+    fi
+    if [[ -n $openwrt ]] && [[ -f $openwrt_iptables ]]; then
+        ssh $openwrt "iptables-restore <$iptables_backup"
+        ssh $openwrt "rm -f $iptables_backup"
+    fi
+}
+
+configure_and_start_dnsmasq() {
+    [[ -z $nodns ]] || return
+    sudo sed -i -r "s/#(conf-dir=\/etc\/dnsmasq\.d\/,\*\.conf)/\1/g" \
+        /etc/dnsmasq.conf
+    sudo mkdir -p /etc/dnsmasq.d
+    sudo chmod 755 /etc/dnsmasq.d
+    if [[ -f $dnsmasq_mitm ]]; then
+        rm -f >/tmp/burpswrt.conf
+        while read line; do
+            case "$line" in
+                "#"*|"") ;;
+                *)
+                    domain="$(echo "$line" | awk '{print $1}')"
+                    ip="$(echo "$line" | awk '{print $2}')"
+                    case "$ip" in
+                        *":"*)
+                            ip="$(
+                                echo "$ip" | awk -F ":" '{print $2}'
+                            )"
+                            ;;
+                    esac
+                    echo "address=/$domain/$ip"
+                    ;;
+            esac
+        done <$dnsmasq_mitm >>/tmp/burpswrt.conf
+        sudo mv /tmp/burpswrt.conf /etc/dnsmasq.d/
+        sudo chmod 644 /etc/dnsmasq.d/burpswrt.conf
+    fi
+    sudo systemctl start dnsmasq
+}
+
+configure_burp() {
+    while read line; do
+        case "$line" in
+            "{{{dns}}}")
+                [[ -f $burp_dns ]] || continue
+                let "count = 1"
+                total="$(cat $burp_dns | \grep -Ev "^#" | wc -l)"
+                while read entry; do
+                    case "$entry" in
+                        "#"*) ;;
+                        *)
+                            host="$(echo "$entry" | awk '{print $1}')"
+                            ip="$(echo "$entry" | awk '{print $2}')"
+                            sed -e "s/TODO_HOSTNAME/$host/g" \
+                                -e "s/TODO_IP/$ip/g" \
+                                templates/dns.json
+                            [[ $count -ge $total ]] || echo ","
+                            let "count += 1"
+                            ;;
+                    esac
+                done <$burp_dns
+                ;;
+            "{{{listeners}}}")
+                [[ -f $burp_listeners ]] || continue
+                let "count = 1"
+                total="$(\grep -cEv "^#" $burp_listeners)"
+                while read entry; do
+                    case "$entry" in
+                        "#"*) ;;
+                        *)
+                            ip="$(
+                                echo "$entry" | \
+                                awk -F ":" '{print $1}'
+                            )"
+                            port="$(
+                                echo "$entry" | \
+                                awk -F ":" '{print $2}'
+                            )"
+                            sed -e "s/TODO_IFACE/$ip/g" \
+                                -e "s/TODO_PORT/$port/g" \
+                                templates/listeners.json
+                            [[ $count -ge $total ]] || echo ","
+                            let "count += 1"
+                            ;;
+                    esac
+                done <$burp_listeners
+                ;;
+            *) echo "$line" ;;
+        esac
+    done <templates/project_options.json >.cache/project_options.json
+    cp templates/user_options.json .cache/
+}
+
+configure_openwrt() {
+    [[ -n $openwrt ]] || return
+    if [[ -f $dnsmasq_mitm ]]; then
+        ssh $openwrt "cp /etc/dnsmasq.conf $dnsmasq_backup"
+        declare -a entries
+        while read line; do
+            case "$line" in
+                "#"*|"") ;;
+                *)
+                    domain="$(echo "$line" | awk '{print $1}')"
+                    ip="$(echo "$line" | awk '{print $2}')"
+                    case "$ip" in
+                        *":"*)
+                            ip="$(
+                                echo "$ip" | awk -F ":" '{print $2}'
+                            )"
+                            ;;
+                    esac
+                    entries+=("address=/$domain/$ip")
+                    ;;
+            esac
+        done <$dnsmasq_mitm
+        cmd="echo \"${entries[@]}\" | sed \"s/ /\n/g\""
+        ssh $openwrt "$cmd >>/etc/dnsmasq.conf"
+        ssh $openwrt "/etc/init.d/dnsmasq restart"
+    fi
+    if [[ -f $openwrt_iptables ]]; then
+        ssh $openwrt "iptables-save >$iptables_backup"
+        declare -a cmds
+        while read line; do
+            case "$line" in
+                "#"*|"") ;;
+                *)
+                    from="$(echo "$line" | awk '{print $1}')"
+                    to="$(echo "$line" | awk '{print $2}')"
+                    cmd="iptables -t nat -A PREROUTING -p tcp"
+                    cmd="$cmd -d $from -j DNAT --to-destination $to"
+                    cmds+=("$(echo "$cmd" | sed "s/ /_/g");")
+                    ;;
+            esac
+        done <$openwrt_iptables
+        ssh $openwrt "$(echo "${cmds[@]}" | sed "s/_/ /g")"
+    fi
+}
+
+create_virtual_ips() {
+    if [[ -f $dnsmasq_mitm ]]; then
+        while read line; do
+            case "$line" in
+                "#"*|"") ;;
+                *)
+                    ip="$(echo "$line" | awk '{print $2}')"
+                    case "$ip" in
+                        *":"*)
+                            dev="$(
+                                echo "$ip" | awk -F ":" '{print $1}'
+                            )"
+                            ip="$(
+                                echo "$ip" | awk -F ":" '{print $2}'
+                            )"
+                            exists="$(
+                                ip -o a | \grep -E "$ip/.+$dev"
+                            )"
+                            if [[ -z $exists ]]; then
+                                sudo ip addr add $ip/32 dev $dev \
+                                    >/dev/null
+                            fi
+                            ;;
+                    esac
+                    ;;
+            esac
+        done <$dnsmasq_mitm
+    fi
+}
+
+usage() {
+    echo "Usage: ${0/*\//} [OPTIONS]"
+    echo
+    echo "A wrapper for using BurpSuite with dnsmasq and optionally"
+    echo "an OpenWRT router"
+    echo
+    echo "Options:"
+    echo "    -c, --clean           Cleanup after a previous run (not"
+    echo "                          usually needed)"
+    echo "    -h, --help            Display this help message"
+    echo "    -n, --no-dns          Don't use dnsmasq on localhost"
+    echo "    -o, --openwrt=HOST    Use specified openwrt host (best"
+    echo "                          to use ssh_config entry with ssh"
+    echo "                          key)"
+    echo
+    exit $1
+}
+
+declare -a args
+unset clean nodns openwrt
+burp_dns="configs/burp.dns"
+burp_listeners="configs/burp.listeners"
+dnsmasq_backup="/etc/dnsmasq.burpswrt"
+dnsmasq_mitm="configs/dnsmasq.mitm"
+iptables_backup="/etc/iptables.burpswrt"
+openwrt_iptables="configs/openwrt.iptables"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        "--") shift && args+=("$@") && break ;;
+        "-c"|"--clean") clean="true" ;;
+        "-h"|"--help") usage 0 ;;
+        "-n"|"--no-dns") nodns="true" ;;
+        "-o"|"--openwrt"*)
+            case "$1" in
+                "--"*"="*)
+                    arg="$(echo "$1" | sed -r "s/[^=]+=//")"
+                    [[ -n $arg ]] || usage 1
+                    ;;
+                *) shift; [[ $# -gt 0 ]] || usage 1; arg="$1" ;;
+            esac
+            openwrt="$arg"
+            ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+[[ -z ${args[@]} ]] || set -- "${args[@]}"
+
+[[ $# -eq 0 ]] || usage 2
+
+if [[ ! -f /etc/dnsmasq.conf ]] && [[ -z $nodns ]]; then
+    echo "Please install dnsmasq"
+    exit 3
+fi
+
+if [[ -n $clean ]]; then
+    cleanup
+    exit 0
+fi
+
+trap cleanup SIGINT
+
+# Ensure directories exist
+mkdir -p .cache configs
+
+# Get BurpSuite if missing
+if [[ ! -f .cache/burpsuite_community.jar ]]; then
+    url="https://portswigger.net/burp/releases/download?type=jar"
+    curl -o .cache/burpsuite_community.jar "$url&product=community"
+fi
+
+# Configure and start dnsmasq
+configure_and_start_dnsmasq
+
+# Create virtual IPs
+create_virtual_ips
+
+# Configure OpenWRT
+configure_openwrt
+
+# Configure burp
+configure_burp
+
+# Start burp
+java -jar .cache/burpsuite_community.jar \
+    --config-file=.cache/project_options.json \
+    --user-config-file=.cache/user_options.json >/dev/null
+
+# Cleanup
+cleanup
+exit 0

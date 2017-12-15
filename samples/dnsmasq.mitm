@@ -1,0 +1,4 @@
+# Domain         # IP
+asdf.example.com eth0:192.168.1.3 # Virtual IP on same subnet
+blah.example.com eth0:192.168.2.1 # Virtual IP on alt subnet, needs route
+.example.com     192.168.1.2 # Default MitM IP

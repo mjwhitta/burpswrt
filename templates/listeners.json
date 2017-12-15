@@ -1,0 +1,8 @@
+{
+    "certificate_mode":"per_host",
+    "listen_mode":"specific_address",
+    "listen_specific_address":"TODO_IFACE",
+    "listener_port":TODO_PORT,
+    "running":true,
+    "support_invisible_proxying":true
+}
